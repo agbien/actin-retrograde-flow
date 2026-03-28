@@ -27,6 +27,7 @@ import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
 from scipy.ndimage import map_coordinates
 from scipy.signal import correlate
+from skimage.transform import radon
 import tifffile
 
 
@@ -193,31 +194,129 @@ def make_kymograph(stack: np.ndarray, line, width: int = 3) -> np.ndarray:
 # Flow rate measurement
 # ---------------------------------------------------------------------------
 
-def measure_flow_rate(kymo: np.ndarray, pixel_size: float,
-                      frame_interval: float) -> dict:
-    """Estimate flow rate from a kymograph using cross-correlation between
-    consecutive frames to find the average spatial shift per time step.
+def _subpixel_peak(cc, lags):
+    """Find sub-pixel cross-correlation peak via parabolic interpolation."""
+    idx = np.argmax(cc)
+    if idx == 0 or idx == len(cc) - 1:
+        return float(lags[idx])
+    y0, y1, y2 = cc[idx - 1], cc[idx], cc[idx + 1]
+    denom = 2.0 * (2.0 * y1 - y0 - y2)
+    if abs(denom) < 1e-12:
+        return float(lags[idx])
+    offset = (y0 - y2) / denom
+    return float(lags[idx]) + offset
 
-    Returns dict with rate in μm/min and px/frame, plus per-frame shifts.
-    """
+
+def measure_flow_rate_xcorr(kymo: np.ndarray, pixel_size: float,
+                            frame_interval: float, gap: int = 1) -> dict:
+    """Estimate flow rate via cross-correlation between rows separated by
+    `gap` frames. Uses sub-pixel peak estimation."""
     shifts = []
-    for i in range(kymo.shape[0] - 1):
+    for i in range(kymo.shape[0] - gap):
         row0 = kymo[i] - kymo[i].mean()
-        row1 = kymo[i + 1] - kymo[i + 1].mean()
+        row1 = kymo[i + gap] - kymo[i + gap].mean()
+        if row0.std() < 1e-6 or row1.std() < 1e-6:
+            continue
         cc = correlate(row0, row1, mode="full")
         lags = np.arange(-len(row0) + 1, len(row0))
-        peak = lags[np.argmax(cc)]
-        shifts.append(peak)
+        peak = _subpixel_peak(cc, lags)
+        shifts.append(peak / gap)
+
+    if not shifts:
+        return {
+            "shifts_px": np.array([]),
+            "mean_shift_px_per_frame": 0.0,
+            "rate_um_per_min": 0.0,
+        }
 
     shifts = np.array(shifts, dtype=float)
-    mean_shift_px = np.median(shifts)  # robust to outliers
+    mean_shift_px = np.median(shifts)
     rate_um_per_min = abs(mean_shift_px) * pixel_size / frame_interval * 60.0
-
     return {
         "shifts_px": shifts,
         "mean_shift_px_per_frame": mean_shift_px,
         "rate_um_per_min": rate_um_per_min,
     }
+
+
+def measure_flow_rate_radon(kymo: np.ndarray, pixel_size: float,
+                            frame_interval: float) -> dict:
+    """Estimate flow rate from the dominant streak angle in the kymograph
+    using the Radon transform. The Radon transform integrates the image
+    along lines at each angle; the angle with the highest variance
+    corresponds to the dominant streak orientation.
+
+    The kymograph has space on x (pixels) and time on y (frames).
+    In skimage.transform.radon, theta is measured from the y-axis:
+      - theta=0°  → vertical streaks (stationary features)
+      - theta=90° → horizontal streaks (instantaneous/artifact)
+      - theta between → diagonal streaks (flow)
+
+    velocity (px/frame) = tan(theta)
+
+    We exclude angles near 0° (stationary) and near 90° (artifacts/
+    unrealistically fast) and search for the dominant flow angle in
+    the physically meaningful range.
+    """
+    # Preprocess: subtract time-mean to remove stationary features,
+    # then subtract spatial mean per row to remove brightness drift
+    kymo_hp = kymo - kymo.mean(axis=0, keepdims=True)
+    kymo_hp = kymo_hp - kymo_hp.mean(axis=1, keepdims=True)
+    std = kymo_hp.std()
+    if std > 0:
+        kymo_hp = kymo_hp / std
+
+    # Compute max physically meaningful angle:
+    # 20 μm/min is a generous upper bound for actin retrograde flow.
+    max_rate = 20.0  # μm/min
+    max_shift_px = max_rate / 60.0 * frame_interval / pixel_size
+    max_angle = np.degrees(np.arctan(max_shift_px))
+    # Search both tilt directions: [min_angle, max_angle] and [180-max_angle, 180-min_angle]
+    min_angle = 10.0  # exclude near-vertical (stationary)
+
+    # Build angle ranges: flow in both directions
+    theta1 = np.linspace(min_angle, max_angle, 200)
+    theta2 = np.linspace(180.0 - max_angle, 180.0 - min_angle, 200)
+    theta = np.concatenate([theta1, theta2])
+
+    sinogram = radon(kymo_hp, theta=theta, circle=False)
+    variances = np.var(sinogram, axis=0)
+    best_idx = np.argmax(variances)
+    best_angle_deg = theta[best_idx]
+
+    shift_px_per_frame = np.tan(np.radians(best_angle_deg))
+    rate_um_per_min = abs(shift_px_per_frame) * pixel_size / frame_interval * 60.0
+
+    return {
+        "shifts_px": np.array([shift_px_per_frame]),
+        "mean_shift_px_per_frame": shift_px_per_frame,
+        "rate_um_per_min": rate_um_per_min,
+        "radon_angle_deg": best_angle_deg,
+        "radon_variances": variances,
+        "radon_theta": theta,
+    }
+
+
+def measure_flow_rate(kymo: np.ndarray, pixel_size: float,
+                      frame_interval: float) -> dict:
+    """Measure flow rate using both cross-correlation and Radon methods,
+    returning the Radon-based result (more robust for low-SNR data) with
+    cross-correlation shifts included for diagnostics."""
+    # Primary: Radon transform (robust, uses whole kymograph)
+    result = measure_flow_rate_radon(kymo, pixel_size, frame_interval)
+
+    # Secondary: cross-correlation at multiple gaps for per-frame diagnostics
+    best_xcorr = {"rate_um_per_min": 0.0, "shifts_px": np.array([])}
+    for gap in [1, 2, 3]:
+        if gap >= kymo.shape[0]:
+            continue
+        xc = measure_flow_rate_xcorr(kymo, pixel_size, frame_interval, gap=gap)
+        if xc["rate_um_per_min"] > best_xcorr["rate_um_per_min"]:
+            best_xcorr = xc
+
+    result["xcorr_rate_um_per_min"] = best_xcorr["rate_um_per_min"]
+    result["shifts_px"] = best_xcorr.get("shifts_px", np.array([]))
+    return result
 
 
 # ---------------------------------------------------------------------------

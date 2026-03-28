@@ -25,9 +25,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
-from scipy.ndimage import map_coordinates
-from scipy.signal import correlate
-from skimage.transform import radon
+from scipy.ndimage import map_coordinates, gaussian_filter
 import tifffile
 
 
@@ -194,129 +192,89 @@ def make_kymograph(stack: np.ndarray, line, width: int = 3) -> np.ndarray:
 # Flow rate measurement
 # ---------------------------------------------------------------------------
 
-def _subpixel_peak(cc, lags):
-    """Find sub-pixel cross-correlation peak via parabolic interpolation."""
-    idx = np.argmax(cc)
-    if idx == 0 or idx == len(cc) - 1:
-        return float(lags[idx])
-    y0, y1, y2 = cc[idx - 1], cc[idx], cc[idx + 1]
-    denom = 2.0 * (2.0 * y1 - y0 - y2)
-    if abs(denom) < 1e-12:
-        return float(lags[idx])
-    offset = (y0 - y2) / denom
-    return float(lags[idx]) + offset
-
-
-def measure_flow_rate_xcorr(kymo: np.ndarray, pixel_size: float,
-                            frame_interval: float, gap: int = 1) -> dict:
-    """Estimate flow rate via cross-correlation between rows separated by
-    `gap` frames. Uses sub-pixel peak estimation."""
-    shifts = []
-    for i in range(kymo.shape[0] - gap):
-        row0 = kymo[i] - kymo[i].mean()
-        row1 = kymo[i + gap] - kymo[i + gap].mean()
-        if row0.std() < 1e-6 or row1.std() < 1e-6:
-            continue
-        cc = correlate(row0, row1, mode="full")
-        lags = np.arange(-len(row0) + 1, len(row0))
-        peak = _subpixel_peak(cc, lags)
-        shifts.append(peak / gap)
-
-    if not shifts:
-        return {
-            "shifts_px": np.array([]),
-            "mean_shift_px_per_frame": 0.0,
-            "rate_um_per_min": 0.0,
-        }
-
-    shifts = np.array(shifts, dtype=float)
-    mean_shift_px = np.median(shifts)
-    rate_um_per_min = abs(mean_shift_px) * pixel_size / frame_interval * 60.0
-    return {
-        "shifts_px": shifts,
-        "mean_shift_px_per_frame": mean_shift_px,
-        "rate_um_per_min": rate_um_per_min,
-    }
-
-
-def measure_flow_rate_radon(kymo: np.ndarray, pixel_size: float,
-                            frame_interval: float) -> dict:
-    """Estimate flow rate from the dominant streak angle in the kymograph
-    using the Radon transform. The Radon transform integrates the image
-    along lines at each angle; the angle with the highest variance
-    corresponds to the dominant streak orientation.
-
-    The kymograph has space on x (pixels) and time on y (frames).
-    In skimage.transform.radon, theta is measured from the y-axis:
-      - theta=0°  → vertical streaks (stationary features)
-      - theta=90° → horizontal streaks (instantaneous/artifact)
-      - theta between → diagonal streaks (flow)
-
-    velocity (px/frame) = tan(theta)
-
-    We exclude angles near 0° (stationary) and near 90° (artifacts/
-    unrealistically fast) and search for the dominant flow angle in
-    the physically meaningful range.
-    """
-    # Preprocess: subtract time-mean to remove stationary features,
-    # then subtract spatial mean per row to remove brightness drift
-    kymo_hp = kymo - kymo.mean(axis=0, keepdims=True)
-    kymo_hp = kymo_hp - kymo_hp.mean(axis=1, keepdims=True)
-    std = kymo_hp.std()
-    if std > 0:
-        kymo_hp = kymo_hp / std
-
-    # Compute max physically meaningful angle:
-    # 20 μm/min is a generous upper bound for actin retrograde flow.
-    max_rate = 20.0  # μm/min
-    max_shift_px = max_rate / 60.0 * frame_interval / pixel_size
-    max_angle = np.degrees(np.arctan(max_shift_px))
-    # Search both tilt directions: [min_angle, max_angle] and [180-max_angle, 180-min_angle]
-    min_angle = 10.0  # exclude near-vertical (stationary)
-
-    # Build angle ranges: flow in both directions
-    theta1 = np.linspace(min_angle, max_angle, 200)
-    theta2 = np.linspace(180.0 - max_angle, 180.0 - min_angle, 200)
-    theta = np.concatenate([theta1, theta2])
-
-    sinogram = radon(kymo_hp, theta=theta, circle=False)
-    variances = np.var(sinogram, axis=0)
-    best_idx = np.argmax(variances)
-    best_angle_deg = theta[best_idx]
-
-    shift_px_per_frame = np.tan(np.radians(best_angle_deg))
-    rate_um_per_min = abs(shift_px_per_frame) * pixel_size / frame_interval * 60.0
-
-    return {
-        "shifts_px": np.array([shift_px_per_frame]),
-        "mean_shift_px_per_frame": shift_px_per_frame,
-        "rate_um_per_min": rate_um_per_min,
-        "radon_angle_deg": best_angle_deg,
-        "radon_variances": variances,
-        "radon_theta": theta,
-    }
-
-
 def measure_flow_rate(kymo: np.ndarray, pixel_size: float,
                       frame_interval: float) -> dict:
-    """Measure flow rate using both cross-correlation and Radon methods,
-    returning the Radon-based result (more robust for low-SNR data) with
-    cross-correlation shifts included for diagnostics."""
-    # Primary: Radon transform (robust, uses whole kymograph)
-    result = measure_flow_rate_radon(kymo, pixel_size, frame_interval)
+    """Automatically measure the dominant streak slope in a kymograph
+    using the structure tensor method.
 
-    # Secondary: cross-correlation at multiple gaps for per-frame diagnostics
-    best_xcorr = {"rate_um_per_min": 0.0, "shifts_px": np.array([])}
-    for gap in [1, 2, 3]:
-        if gap >= kymo.shape[0]:
-            continue
-        xc = measure_flow_rate_xcorr(kymo, pixel_size, frame_interval, gap=gap)
-        if xc["rate_um_per_min"] > best_xcorr["rate_um_per_min"]:
-            best_xcorr = xc
+    The structure tensor captures the local orientation of intensity
+    gradients at every pixel. By averaging the tensor over the entire
+    kymograph (after removing stationary features), the dominant
+    orientation of moving streaks is recovered — even in noisy or
+    compressed data where edge detection fails.
 
-    result["xcorr_rate_um_per_min"] = best_xcorr["rate_um_per_min"]
-    result["shifts_px"] = best_xcorr.get("shifts_px", np.array([]))
-    return result
+    The dominant angle is converted to a flow rate via point-slope form:
+        rate (μm/min) = |Δx / Δt| * 60
+
+    where Δx and Δt are read from the kymograph axes (space in μm,
+    time in seconds).
+    """
+    T, N = kymo.shape
+
+    # --- Preprocess: isolate moving features ---
+    # Temporal derivative: diff along time axis highlights motion,
+    # suppresses stationary structures completely
+    kymo_diff = np.diff(kymo.astype(np.float64), axis=0)
+    # Also subtract the spatial mean per row to remove global flicker
+    kymo_hp = kymo_diff - kymo_diff.mean(axis=1, keepdims=True)
+    # Smooth to reduce noise
+    kymo_hp = gaussian_filter(kymo_hp, sigma=1.0)
+    T, N = kymo_hp.shape
+
+    # --- Structure tensor in physical coordinates ---
+    # Compute gradients in physical units so the angle is meaningful.
+    # x-axis: space (μm), y-axis: time (s)
+    # np.gradient with axis spacing: dx = pixel_size, dy = frame_interval
+    Iy, Ix = np.gradient(kymo_hp, frame_interval, pixel_size)
+
+    # Structure tensor components, smoothed over a neighborhood
+    sigma_st = max(3.0, min(T, N) * 0.15)
+    Jxx = gaussian_filter(Ix * Ix, sigma=sigma_st)
+    Jxy = gaussian_filter(Ix * Iy, sigma=sigma_st)
+    Jyy = gaussian_filter(Iy * Iy, sigma=sigma_st)
+
+    # Global structure tensor (sum over all pixels)
+    S_xx = Jxx.sum()
+    S_xy = Jxy.sum()
+    S_yy = Jyy.sum()
+
+    # Dominant gradient orientation
+    theta = 0.5 * np.arctan2(2 * S_xy, S_xx - S_yy)
+
+    # The gradient is perpendicular to the streak direction.
+    # Streak direction = theta + π/2.
+    # Streak slope (dx/dt) where x=μm, t=seconds:
+    #   streak runs along direction (cos(theta+π/2), sin(theta+π/2))
+    #                              = (-sin(theta), cos(theta))
+    #   dx/dt = -sin(theta) / cos(theta) = -tan(theta)
+    # But we only care about |dx/dt| for the rate.
+
+    if abs(np.cos(theta)) < 1e-6:
+        velocity_um_per_s = 0.0
+    else:
+        velocity_um_per_s = abs(np.sin(theta) / np.cos(theta))
+
+    rate_um_per_min = velocity_um_per_s * 60.0
+
+    # Coherence: how strongly oriented is the structure tensor?
+    trace = S_xx + S_yy
+    det = S_xx * S_yy - S_xy * S_xy
+    discrim = max(0, trace * trace - 4 * det)
+    lam1 = (trace + np.sqrt(discrim)) / 2
+    lam2 = (trace - np.sqrt(discrim)) / 2
+    coherence = ((lam1 - lam2) / (lam1 + lam2)) ** 2 if (lam1 + lam2) > 0 else 0
+
+    return {
+        "streaks": [{
+            "rate_um_per_min": rate_um_per_min,
+            "slope_um_per_s": velocity_um_per_s,
+            "angle_deg": np.degrees(theta),
+            "coherence": coherence,
+        }],
+        "rate_um_per_min": rate_um_per_min,
+        "coherence": coherence,
+        "angle_deg": np.degrees(theta),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -325,8 +283,8 @@ def measure_flow_rate(kymo: np.ndarray, pixel_size: float,
 
 def plot_results(stack, lines, kymographs, measurements,
                  pixel_size, frame_interval, output_dir):
-    """Generate a multi-panel figure with the annotated image, kymographs,
-    and a summary bar chart of flow rates."""
+    """Generate a multi-panel figure with the annotated image, kymographs
+    with fitted slopes overlaid, and a summary bar chart of flow rates."""
 
     n_lines = len(lines)
     fig = plt.figure(figsize=(5 + 5 * n_lines, 10))
@@ -343,18 +301,35 @@ def plot_results(stack, lines, kymographs, measurements,
     ax_img.set_title("Growth cone + lines")
     ax_img.axis("off")
 
-    # -- Kymograph panels --
+    # -- Kymograph panels with fit lines --
     for i in range(n_lines):
         ax_k = fig.add_subplot(2, n_lines + 1, 2 + i)
         kymo = kymographs[i]
-        t_extent = kymo.shape[0] * frame_interval  # seconds
-        d_extent = kymo.shape[1] * pixel_size       # μm
+        t_extent = kymo.shape[0] * frame_interval
+        d_extent = kymo.shape[1] * pixel_size
         ax_k.imshow(kymo, cmap="gray", aspect="auto",
                     extent=[0, d_extent, t_extent, 0])
         ax_k.set_xlabel("Distance (μm)")
         ax_k.set_ylabel("Time (s)")
         rate = measurements[i]["rate_um_per_min"]
         ax_k.set_title(f"L{i+1} kymograph\n{rate:.1f} μm/min")
+
+        # Overlay detected streak lines
+        for streak in measurements[i].get("streaks", []):
+            angle_rad = np.radians(streak["angle_deg"])
+            dist = streak["dist"]
+            # Reconstruct line endpoints in pixel space, then convert
+            cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
+            # Line in pixel coords: x*cos + y*sin = dist
+            # Solve for x at y=0 and y=T-1
+            if abs(sin_a) > 1e-6:
+                x_at_y0 = dist / cos_a if abs(cos_a) > 1e-6 else 0
+                y0_px, y1_px = 0, kymo.shape[0] - 1
+                x0_px = (dist - y0_px * sin_a) / cos_a if abs(cos_a) > 1e-6 else 0
+                x1_px = (dist - y1_px * sin_a) / cos_a if abs(cos_a) > 1e-6 else 0
+                ax_k.plot([x0_px * pixel_size, x1_px * pixel_size],
+                          [y0_px * frame_interval, y1_px * frame_interval],
+                          "r-", linewidth=1.5, alpha=0.7)
 
     # -- Bar chart of flow rates --
     ax_bar = fig.add_subplot(2, 1, 2)
@@ -372,52 +347,31 @@ def plot_results(stack, lines, kymographs, measurements,
     print(f"Saved results figure: {out_path}")
     plt.show()
 
-    # -- Per-line shift plots --
-    fig2, axes2 = plt.subplots(1, n_lines, figsize=(5 * n_lines, 3),
-                               squeeze=False)
-    for i in range(n_lines):
-        ax = axes2[0, i]
-        shifts = measurements[i]["shifts_px"]
-        ax.plot(np.arange(len(shifts)) * frame_interval, shifts * pixel_size,
-                "k.-", markersize=4)
-        ax.axhline(measurements[i]["mean_shift_px_per_frame"] * pixel_size,
-                    color="red", linestyle="--", label="median")
-        ax.set_xlabel("Time (s)")
-        ax.set_ylabel("Shift (μm)")
-        ax.set_title(f"L{i+1} frame-to-frame shift")
-        ax.legend(fontsize=8)
-    fig2.tight_layout()
-    out_path2 = os.path.join(output_dir, "actin_flow_shifts.png")
-    fig2.savefig(out_path2, dpi=200, bbox_inches="tight")
-    print(f"Saved shift plots: {out_path2}")
-    plt.show()
-
 
 # ---------------------------------------------------------------------------
 # CSV export
 # ---------------------------------------------------------------------------
 
 def export_csv(lines, measurements, pixel_size, frame_interval, output_dir):
-    """Write a summary CSV and per-line shift CSVs."""
+    """Write a summary CSV with flow rates and fit quality."""
     summary_path = os.path.join(output_dir, "flow_rate_summary.csv")
     with open(summary_path, "w") as f:
-        f.write("line,x0,y0,x1,y1,length_um,rate_um_per_min,median_shift_px\n")
+        f.write("line,x0,y0,x1,y1,length_um,rate_um_per_min,"
+                "n_streaks,slope_um_per_s,r_squared\n")
         for i, (line, m) in enumerate(zip(lines, measurements)):
             (x0, y0), (x1, y1) = line
             length = np.hypot(x1 - x0, y1 - y0) * pixel_size
+            streaks = m.get("streaks", [])
+            if streaks:
+                avg_slope = np.mean([s["slope_um_per_s"] for s in streaks])
+                avg_r2 = np.mean([s["r_squared"] for s in streaks])
+            else:
+                avg_slope = 0.0
+                avg_r2 = 0.0
             f.write(f"L{i+1},{x0:.1f},{y0:.1f},{x1:.1f},{y1:.1f},"
                     f"{length:.2f},{m['rate_um_per_min']:.2f},"
-                    f"{m['mean_shift_px_per_frame']:.2f}\n")
+                    f"{len(streaks)},{avg_slope:.4f},{avg_r2:.3f}\n")
     print(f"Saved summary: {summary_path}")
-
-    for i, m in enumerate(measurements):
-        shift_path = os.path.join(output_dir, f"L{i+1}_shifts.csv")
-        with open(shift_path, "w") as f:
-            f.write("frame_pair,time_s,shift_px,shift_um\n")
-            for j, s in enumerate(m["shifts_px"]):
-                f.write(f"{j}-{j+1},{j * frame_interval:.1f},"
-                        f"{s:.2f},{s * pixel_size:.4f}\n")
-        print(f"Saved: {shift_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -462,16 +416,20 @@ def main():
 
     print(f"\n{len(lines)} line(s) drawn. Generating kymographs...")
 
-    # Generate kymographs + measure
+    # Generate kymographs
     kymographs = []
-    measurements = []
     for i, line in enumerate(lines):
         kymo = make_kymograph(stack, line, width=args.line_width)
         kymographs.append(kymo)
+
+    # Automatically detect streaks and measure flow rates
+    measurements = []
+    for i, kymo in enumerate(kymographs):
         m = measure_flow_rate(kymo, args.pixel_size, args.frame_interval)
         measurements.append(m)
+        n_streaks = len(m.get("streaks", []))
         print(f"  L{i+1}: {m['rate_um_per_min']:.2f} μm/min "
-              f"(median shift: {m['mean_shift_px_per_frame']:.2f} px/frame)")
+              f"({n_streaks} streak(s) detected)")
 
     # Save kymographs as TIFFs
     for i, kymo in enumerate(kymographs):

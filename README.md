@@ -24,10 +24,9 @@ pip install -r requirements.txt
 
 | Package | Purpose |
 |---------|---------|
-| `numpy` | Array operations and numerical computation |
-| `matplotlib` | Visualization, interactive line drawing GUI, and figure generation. Requires a GUI backend (TkAgg is used by default) |
-| `scipy` | `scipy.ndimage.map_coordinates` for subpixel intensity sampling along lines; `scipy.signal.correlate` for cross-correlation-based flow measurement |
-| `scikit-image` | Image processing utilities |
+| `numpy` | Array operations, `numpy.polyfit` for least-squares line fitting on kymograph streaks |
+| `matplotlib` | Visualization, interactive line drawing and slope picking GUI. Requires a GUI backend (TkAgg is used by default) |
+| `scipy` | `scipy.ndimage.map_coordinates` for subpixel intensity sampling along lines |
 | `tifffile` | Reading and writing TIFF stacks, the standard format for microscopy image series |
 
 #### Platform-specific notes
@@ -127,38 +126,41 @@ The result is a 2D array of shape `(T, N)` where `T` is the number of time frame
 
 Each kymograph is saved as a 32-bit TIFF file so it can be opened in ImageJ/FIJI for further manual analysis if desired.
 
-### Step 4: Flow rate measurement via cross-correlation
+### Step 4: Flow rate measurement via interactive slope fitting
 
-The tool measures the actin flow rate from each kymograph using **temporal cross-correlation**, which is a robust automated method that does not require manual feature tracking.
+For each kymograph, a second interactive window opens where you measure the flow rate by clicking points along diagonal streaks and fitting a line through them.
 
-**Algorithm:**
+**How it works:**
 
-1. For each pair of consecutive time frames `(t, t+1)` in the kymograph, the tool extracts the two corresponding rows — each row is a 1D intensity profile along the line at that time point.
+1. The kymograph is displayed with calibrated axes (distance in μm on x, time in seconds on y).
 
-2. Each row is **mean-subtracted** (the mean intensity is removed) so that the cross-correlation measures the similarity of intensity *patterns* rather than being dominated by overall brightness changes.
+2. You **left-click multiple points** along a single diagonal streak — the more points you click, the more accurate the fit. Clicking 3-5 points along a clearly visible streak is usually sufficient.
 
-3. The **normalized cross-correlation** between the two rows is computed using `scipy.signal.correlate` in "full" mode. This produces a correlation function over all possible spatial lags (shifts).
-
-4. The lag at which the correlation is maximized gives the **spatial shift** (in pixels) of the intensity pattern between the two frames. A positive shift means the pattern moved in one direction along the line; a negative shift means it moved in the other direction.
-
-5. This process yields one shift value per consecutive frame pair, giving a time series of `T-1` shift values.
-
-6. The **median** of all shift values is taken as the representative shift per frame. The median is used instead of the mean because it is robust to outlier frames (e.g., frames where a bright feature enters or leaves the field of view, or where the growth cone moves).
-
-7. The shift in pixels per frame is converted to a flow rate in microns per minute:
+3. **Right-click** (or press Enter) to finalize the streak. The tool fits a line through your clicked points using `numpy.polyfit` (least-squares, degree 1):
 
 ```
-flow_rate (um/min) = |median_shift (px)| * pixel_size (um/px) / frame_interval (s) * 60 (s/min)
+x(t) = slope * t + intercept
 ```
 
-**Why cross-correlation?**
+where `x` is position in μm and `t` is time in seconds. The fitted line is overlaid in red, and the flow rate and R² are displayed.
 
-Cross-correlation is the standard approach for kymograph-based flow measurements because:
-- It uses all spatial information in each row, not just individual features
-- It does not require identifying or tracking individual actin speckles
-- It is robust to noise and intensity fluctuations
-- It gives sub-pixel precision when the true shift falls between integer pixel values (the correlation peak is interpolated)
-- It produces a per-frame-pair measurement, allowing you to assess variability over time
+4. The flow rate is simply the absolute value of the slope, converted to μm/min:
+
+```
+rate (μm/min) = |slope (μm/s)| × 60
+```
+
+5. You can **measure multiple streaks** on the same kymograph — just keep clicking new sets of points and right-clicking to fit. The final rate for that line is the average across all measured streaks.
+
+6. Press **Enter** with no active points (or close the window) to move to the next kymograph.
+
+**Why manual slope fitting?**
+
+- It is the standard method used in the kymograph literature — the human eye is very good at identifying coherent streaks even in noisy data
+- The least-squares fit through multiple points is more robust than a two-point measurement
+- The R² value tells you how well the streak follows a straight line (R² > 0.9 is a good fit)
+- You can measure multiple streaks per kymograph and average them for a more reliable estimate
+- It works on any data quality — from raw 16-bit microscopy TIFFs to compressed presentation videos
 
 ### Step 5: Output generation
 
@@ -168,11 +170,9 @@ The tool produces several output files, described below.
 
 | File | Description |
 |------|-------------|
-| `actin_flow_results.png` | **Main results figure.** A multi-panel composite containing: (1) the first frame of the image stack with all drawn lines overlaid in red and labeled, (2) one kymograph panel per line with calibrated axes (distance in um, time in seconds) and the measured flow rate annotated in the title, and (3) a bar chart summarizing all flow rates, styled similarly to standard actin retrograde flow figures in the literature. Saved at 200 DPI. |
-| `actin_flow_shifts.png` | **Diagnostic shift plots.** One panel per line showing the frame-to-frame spatial shift (in microns) as a function of time, with the median shift marked as a red dashed line. These plots let you assess whether the flow rate was constant throughout the acquisition or changed over time (e.g., due to growth cone advance or retraction). Large outlier shifts may indicate problematic frames. |
-| `L{n}_kymograph.tif` | **Raw kymograph data** for line `n`, saved as a 32-bit floating point TIFF. Can be opened in ImageJ/FIJI for manual inspection, additional measurements (e.g., manual slope fitting), or further processing. |
-| `flow_rate_summary.csv` | **Summary table** with one row per line. Columns: line label, start/end coordinates (in pixels), line length (in microns), flow rate (in um/min), and median shift (in px/frame). Suitable for import into Excel, R, or Python for downstream statistical analysis. |
-| `L{n}_shifts.csv` | **Per-frame shift data** for line `n`. Columns: frame pair index, time (in seconds), shift (in pixels), and shift (in microns). Useful for time-resolved analysis or for identifying frames where the measurement may be unreliable. |
+| `actin_flow_results.png` | **Main results figure.** A multi-panel composite containing: (1) the first frame of the image stack with all drawn lines overlaid in red and labeled, (2) one kymograph panel per line with calibrated axes (distance in μm, time in seconds), fitted slope lines overlaid in red, and the measured flow rate in the title, and (3) a bar chart summarizing all flow rates. Saved at 200 DPI. |
+| `L{n}_kymograph.tif` | **Raw kymograph data** for line `n`, saved as a 32-bit floating point TIFF. Can be opened in ImageJ/FIJI for manual inspection or further processing. |
+| `flow_rate_summary.csv` | **Summary table** with one row per line. Columns: line label, start/end coordinates (in pixels), line length (in μm), flow rate (in μm/min), number of streaks measured, fitted slope (μm/s), and R² value. Suitable for import into Excel, R, or Python for downstream statistical analysis. |
 
 ## Interpreting Results
 

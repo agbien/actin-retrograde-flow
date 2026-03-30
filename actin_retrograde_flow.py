@@ -1,19 +1,16 @@
 """
 Actin Retrograde Flow Measurement Tool
 
-Measures retrograde flow rate of actin in neuronal growth cones from
-TIRF microscopy image stacks. The user draws lines along flow axes on
-the growth cone image, and the tool generates kymographs and uses a
-vision model (Claude Sonnet) to identify diagonal streaks and compute
-flow rates from their slopes via point-slope form.
+Fully automated pipeline for measuring actin retrograde flow rates in
+neuronal growth cones from TIRF microscopy image stacks:
+
+  1. Automatically detects the growth cone and places measurement lines
+  2. Generates kymographs along each line
+  3. Uses Claude Sonnet (vision model) to read diagonal streak slopes
+  4. Computes flow rates via point-slope form: rate = |dx/dt| * 60
 
 Usage:
     python actin_retrograde_flow.py <image_stack> [--pixel-size 0.108] [--frame-interval 2.0]
-
-    image_stack:      Path to a TIFF stack (multi-frame) or a directory of
-                      sequentially numbered single-frame TIFFs.
-    --pixel-size:     um per pixel (default: 0.108 um/px, typical for 60x TIRF)
-    --frame-interval: seconds between frames (default: 2.0 s)
 
 Requires ANTHROPIC_API_KEY environment variable to be set.
 """
@@ -33,7 +30,8 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import (map_coordinates, label, binary_dilation,
+                           binary_erosion, gaussian_filter, center_of_mass)
 import tifffile
 
 
@@ -62,7 +60,135 @@ def load_stack(path: str) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Interactive line drawing
+# Automatic growth cone detection and line placement
+# ---------------------------------------------------------------------------
+
+def find_growth_cone(frame: np.ndarray) -> dict:
+    """Detect the growth cone in a TIRF image.
+
+    Strategy:
+      1. Threshold to find bright regions.
+      2. Find the largest connected component (the neuron).
+      3. The growth cone tip is the point on the neuron boundary
+         furthest from the neuron's centroid.
+      4. The growth cone center is the centroid of the local region
+         around the tip.
+      5. The retrograde flow direction points from tip toward the
+         neuron centroid (inward along the axon).
+
+    Returns dict with tip, gc_center, flow_direction, gc_radius, or
+    None if detection fails.
+    """
+    smooth = gaussian_filter(frame, sigma=3)
+    thresh = np.percentile(smooth[smooth > 0], 75)
+    mask = smooth > thresh
+
+    mask = binary_erosion(mask, iterations=2)
+    mask = binary_dilation(mask, iterations=2)
+
+    labeled, n = label(mask)
+    if n == 0:
+        return None
+    sizes = [(labeled == i).sum() for i in range(1, n + 1)]
+    largest = np.argmax(sizes) + 1
+    neuron_mask = labeled == largest
+
+    cy, cx = center_of_mass(neuron_mask)
+
+    ys, xs = np.where(neuron_mask)
+    dists = np.hypot(xs - cx, ys - cy)
+    tip_idx = np.argmax(dists)
+    tip_x, tip_y = float(xs[tip_idx]), float(ys[tip_idx])
+
+    gc_radius = min(frame.shape) * 0.15
+    dist_from_tip = np.hypot(
+        np.arange(frame.shape[1])[None, :] - tip_x,
+        np.arange(frame.shape[0])[:, None] - tip_y,
+    )
+    gc_mask = neuron_mask & (dist_from_tip < gc_radius)
+
+    if gc_mask.sum() < 10:
+        gc_mask = neuron_mask
+
+    gc_ys, gc_xs = np.where(gc_mask)
+    gc_cx, gc_cy = float(gc_xs.mean()), float(gc_ys.mean())
+
+    flow_dx = cx - tip_x
+    flow_dy = cy - tip_y
+    flow_len = np.hypot(flow_dx, flow_dy)
+    if flow_len > 0:
+        flow_dx /= flow_len
+        flow_dy /= flow_len
+
+    return {
+        "tip": (tip_x, tip_y),
+        "gc_center": (gc_cx, gc_cy),
+        "neuron_centroid": (float(cx), float(cy)),
+        "flow_direction": (float(flow_dx), float(flow_dy)),
+        "gc_radius": gc_radius,
+    }
+
+
+def auto_place_lines(frame: np.ndarray, n_lines: int = 3,
+                     line_length_frac: float = 0.35) -> list:
+    """Automatically detect the growth cone and place measurement lines.
+
+    The primary line runs from near the tip through the body of the
+    growth cone along the retrograde flow axis (tip -> cell body).
+    Additional lines are rotated +-30 degrees. Lines are centered
+    between the tip and the growth cone center so they span the
+    lamellipodium where actin flow is most visible.
+
+    Args:
+        frame:  First frame of the stack (2D array)
+        n_lines: Number of lines to place (default 3)
+        line_length_frac: Line length as fraction of image size
+
+    Returns:
+        list of ((x0,y0), (x1,y1)) tuples, or empty list on failure.
+    """
+    gc = find_growth_cone(frame)
+    if gc is None:
+        print("Warning: Could not detect growth cone.")
+        return []
+
+    tip_x, tip_y = gc["tip"]
+    gc_cx, gc_cy = gc["gc_center"]
+    fdx, fdy = gc["flow_direction"]
+    H, W = frame.shape
+    half = min(H, W) * line_length_frac / 2
+
+    # Center lines between the tip and the GC center, slightly inward
+    # so they pass through the lamellipodium body
+    line_cx = tip_x + (gc_cx - tip_x) * 0.6
+    line_cy = tip_y + (gc_cy - tip_y) * 0.6
+
+    lines = []
+    angles = [0]
+    for i in range(1, (n_lines + 1) // 2 + 1):
+        angles.extend([-30 * i, 30 * i])
+    angles = angles[:n_lines]
+
+    for ang_deg in angles:
+        ang_rad = np.radians(ang_deg)
+        dx = fdx * np.cos(ang_rad) - fdy * np.sin(ang_rad)
+        dy = fdx * np.sin(ang_rad) + fdy * np.cos(ang_rad)
+
+        x0 = np.clip(line_cx - half * dx, 1, W - 2)
+        y0 = np.clip(line_cy - half * dy, 1, H - 2)
+        x1 = np.clip(line_cx + half * dx, 1, W - 2)
+        y1 = np.clip(line_cy + half * dy, 1, H - 2)
+        lines.append(((x0, y0), (x1, y1)))
+
+    print(f"  Growth cone detected: tip=({tip_x:.0f},{tip_y:.0f}), "
+          f"center=({gc_cx:.0f},{gc_cy:.0f}), "
+          f"flow direction=({fdx:.2f},{fdy:.2f})")
+
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Interactive line drawing (fallback)
 # ---------------------------------------------------------------------------
 
 class LineDrawer:
@@ -536,8 +662,13 @@ def main():
                         help="Vision model to use (default: claude-sonnet-4-6)")
     parser.add_argument("--api-key", type=str, default=None,
                         help="Anthropic API key (default: ANTHROPIC_API_KEY env var)")
+    parser.add_argument("--manual-lines", action="store_true",
+                        help="Draw lines manually instead of auto-detecting")
+    parser.add_argument("--n-lines", type=int, default=3,
+                        help="Number of lines to auto-place (default: 3)")
     parser.add_argument("--interactive", action="store_true",
-                        help="Use interactive manual mode instead of vision model")
+                        help="Use interactive manual mode for everything "
+                             "(manual lines + manual slope picking)")
     args = parser.parse_args()
 
     # API key
@@ -565,16 +696,25 @@ def main():
         out_dir = str(p.parent if p.is_file() else p) + "_results"
     os.makedirs(out_dir, exist_ok=True)
 
-    # Draw lines interactively
-    print("Draw lines on the growth cone along the actin flow axes.")
-    print("Click two points per line. Press Enter or click Done when finished.")
-    drawer = LineDrawer(stack[0])
-    lines = drawer.run()
+    # Place lines on the growth cone
+    if args.manual_lines or args.interactive:
+        print("Draw lines on the growth cone along the actin flow axes.")
+        print("Click two points per line. Press Enter or click Done when finished.")
+        drawer = LineDrawer(stack[0])
+        lines = drawer.run()
+        if not lines:
+            sys.exit("No lines drawn -- exiting.")
+    else:
+        print("Auto-detecting growth cone...")
+        lines = auto_place_lines(stack[0], n_lines=args.n_lines)
+        if not lines:
+            print("Auto-detection failed. Falling back to manual line drawing.")
+            drawer = LineDrawer(stack[0])
+            lines = drawer.run()
+            if not lines:
+                sys.exit("No lines drawn -- exiting.")
 
-    if not lines:
-        sys.exit("No lines drawn -- exiting.")
-
-    print(f"\n{len(lines)} line(s) drawn. Generating kymographs...")
+    print(f"\n{len(lines)} line(s) placed. Generating kymographs...")
 
     # Generate kymographs
     kymographs = []

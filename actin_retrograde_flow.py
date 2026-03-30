@@ -40,22 +40,57 @@ import tifffile
 # ---------------------------------------------------------------------------
 
 def load_stack(path: str) -> np.ndarray:
-    """Load a TIRF image stack. Returns array of shape (T, Y, X)."""
+    """Load a TIRF image stack. Returns array of shape (T, Y, X).
+
+    Supports:
+      - Multi-frame TIFF (.tif, .tiff)
+      - Nikon NIS-Elements (.nd2)
+      - Directory of single-frame TIFFs
+    """
     p = Path(path)
+
     if p.is_dir():
         files = sorted(p.glob("*.tif")) + sorted(p.glob("*.tiff"))
         if not files:
             sys.exit(f"No TIFF files found in directory: {path}")
         frames = [tifffile.imread(str(f)) for f in files]
         stack = np.stack(frames, axis=0)
+
+    elif p.suffix.lower() == ".nd2":
+        try:
+            import nd2
+        except ImportError:
+            sys.exit("Error: 'nd2' package required for .nd2 files. "
+                     "Run: pip install nd2")
+        with nd2.ND2File(str(p)) as f:
+            stack = f.asarray()
+            # nd2 metadata often has pixel size and frame interval
+            meta = f.metadata
+            if meta:
+                voxel = getattr(meta, 'channels', None)
+                print(f"  nd2 metadata: {f.sizes}")
+                if hasattr(meta, 'channels') and meta.channels:
+                    for ch in meta.channels:
+                        print(f"    Channel: {ch.channel.name}")
     else:
         stack = tifffile.imread(str(p))
 
     if stack.ndim == 2:
         sys.exit("Only a single frame found — need a time series (multiple frames).")
-    if stack.ndim == 4:
+
+    # Handle common nd2/TIFF shapes:
+    # (T, Y, X) — already correct
+    # (T, C, Y, X) — multi-channel, take first
+    # (T, Z, Y, X) — z-stack, take first slice
+    # (T, C, Z, Y, X) — take first channel, first z
+    if stack.ndim == 5:
+        stack = stack[:, 0, 0]
+    elif stack.ndim == 4:
         stack = stack[:, 0]
-    print(f"Loaded stack: {stack.shape[0]} frames, {stack.shape[1]}x{stack.shape[2]} px")
+
+    print(f"Loaded stack: {stack.shape[0]} frames, "
+          f"{stack.shape[1]}x{stack.shape[2]} px, "
+          f"dtype={stack.dtype}")
     return stack.astype(np.float64)
 
 

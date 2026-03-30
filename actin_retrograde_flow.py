@@ -583,57 +583,90 @@ def _measure_flow_rate_interactive(kymo, pixel_size, frame_interval):
 
 def plot_results(stack, lines, kymographs, measurements,
                  pixel_size, frame_interval, output_dir):
-    """Generate a multi-panel figure with the annotated image, kymographs
-    with detected slopes overlaid, and a summary bar chart of flow rates."""
+    """Generate a figure: [Image + lines] [Rate table] [Kymographs...]"""
+    from matplotlib.gridspec import GridSpec
 
-    n_lines = len(lines)
-    fig = plt.figure(figsize=(5 + 5 * n_lines, 10))
+    n = len(lines)
+    n_cols = n + 2  # image + table + n kymographs
+    fig = plt.figure(figsize=(4.5 * n_cols, 5.5))
+    gs = GridSpec(1, n_cols, figure=fig, width_ratios=[1.2, 0.8] + [1.0] * n,
+                  wspace=0.3)
+    colors = ["red", "cyan", "lime", "yellow", "magenta"]
 
-    # -- Panel 1: annotated first frame --
-    ax_img = fig.add_subplot(2, n_lines + 1, 1)
+    # -- Column 1: annotated first frame --
+    ax_img = fig.add_subplot(gs[0, 0])
     ax_img.imshow(stack[0], cmap="gray")
     for i, line in enumerate(lines):
         (x0, y0), (x1, y1) = line
-        ax_img.plot([x0, x1], [y0, y1], "r-", linewidth=1.5)
+        ax_img.plot([x0, x1], [y0, y1], color=colors[i % len(colors)], lw=2)
         mx, my = (x0 + x1) / 2, (y0 + y1) / 2
-        ax_img.text(mx, my, f"L{i+1}", color="yellow", fontsize=9,
-                    fontweight="bold", ha="center", va="bottom")
-    ax_img.set_title("Growth cone + lines")
+        ax_img.text(mx, my, f"L{i+1}", color=colors[i % len(colors)],
+                    fontsize=11, fontweight="bold", ha="center", va="bottom")
+    ax_img.set_title("Growth cone")
     ax_img.axis("off")
 
-    # -- Kymograph panels with detected streak lines --
-    for i in range(n_lines):
-        ax_k = fig.add_subplot(2, n_lines + 1, 2 + i)
+    # -- Column 2: flow rate table --
+    ax_tbl = fig.add_subplot(gs[0, 1])
+    ax_tbl.axis("off")
+
+    table_data = []
+    cell_colors = []
+    for i, m in enumerate(measurements):
+        rate = m["rate_um_per_min"]
+        table_data.append([f"L{i+1}", f"{rate:.1f}"])
+        cell_colors.append([colors[i % len(colors)], "white"])
+
+    rates = [m["rate_um_per_min"] for m in measurements]
+    valid_rates = [r for r in rates if r > 0]
+    mean_rate = np.mean(valid_rates) if valid_rates else 0.0
+    table_data.append(["Mean", f"{mean_rate:.1f}"])
+    cell_colors.append(["lightgray", "lightgray"])
+
+    tbl = ax_tbl.table(
+        cellText=table_data,
+        colLabels=["Line", "Rate\n(um/min)"],
+        cellColours=cell_colors,
+        colColours=["#d9d9d9", "#d9d9d9"],
+        cellLoc="center",
+        loc="center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(11)
+    tbl.scale(1.0, 1.8)
+    for i in range(len(table_data)):
+        cell = tbl[i + 1, 0]
+        if i < len(measurements):
+            cell.set_text_props(color="white", fontweight="bold")
+        else:
+            cell.set_text_props(fontweight="bold")
+        if i == len(measurements):
+            tbl[i + 1, 1].set_text_props(fontweight="bold", fontsize=12)
+    ax_tbl.set_title("Flow Rates", fontsize=11, fontweight="bold", pad=12)
+
+    # -- Columns 3+: kymographs --
+    for i in range(n):
+        ax_k = fig.add_subplot(gs[0, i + 2])
         kymo = kymographs[i]
         t_extent = kymo.shape[0] * frame_interval
         d_extent = kymo.shape[1] * pixel_size
         ax_k.imshow(kymo, cmap="gray", aspect="auto",
                     extent=[0, d_extent, t_extent, 0])
         ax_k.set_xlabel("Distance (um)")
-        ax_k.set_ylabel("Time (s)")
-        rate = measurements[i]["rate_um_per_min"]
-        ax_k.set_title(f"L{i+1} kymograph\n{rate:.1f} um/min")
+        if i == 0:
+            ax_k.set_ylabel("Time (s)")
+        else:
+            ax_k.set_ylabel("")
+            ax_k.tick_params(labelleft=False)
+        ax_k.set_title(f"L{i+1}", color=colors[i % len(colors)],
+                       fontweight="bold", fontsize=11)
 
-        # Overlay detected streak lines from vision model
         for streak in measurements[i].get("streaks", []):
             if "x1" in streak and "t1" in streak:
                 ax_k.plot([streak["x1"], streak["x2"]],
                           [streak["t1"], streak["t2"]],
                           "r-", linewidth=2, alpha=0.8)
-                mx = (streak["x1"] + streak["x2"]) / 2
-                mt = (streak["t1"] + streak["t2"]) / 2
                 ax_k.plot(streak["x1"], streak["t1"], "r+", ms=10, mew=2)
                 ax_k.plot(streak["x2"], streak["t2"], "r+", ms=10, mew=2)
-
-    # -- Bar chart of flow rates --
-    ax_bar = fig.add_subplot(2, 1, 2)
-    labels = [f"L{i+1}" for i in range(n_lines)]
-    rates = [m["rate_um_per_min"] for m in measurements]
-    ax_bar.bar(labels, rates, color="steelblue", edgecolor="black")
-    ax_bar.set_ylabel("Actin flow rate (um/min)")
-    ax_bar.set_title("Actin retrograde flow")
-    for j, r in enumerate(rates):
-        ax_bar.text(j, r + 0.2, f"{r:.1f}", ha="center", fontsize=9)
 
     fig.tight_layout()
     out_path = os.path.join(output_dir, "actin_flow_results.png")

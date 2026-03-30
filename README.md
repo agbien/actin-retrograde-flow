@@ -24,10 +24,17 @@ pip install -r requirements.txt
 
 | Package | Purpose |
 |---------|---------|
-| `numpy` | Array operations, `numpy.polyfit` for least-squares line fitting on kymograph streaks |
-| `matplotlib` | Visualization, interactive line drawing and slope picking GUI. Requires a GUI backend (TkAgg is used by default) |
+| `numpy` | Array operations and numerical computation |
+| `matplotlib` | Visualization, interactive line drawing GUI, and figure generation. Requires a GUI backend (TkAgg is used by default) |
 | `scipy` | `scipy.ndimage.map_coordinates` for subpixel intensity sampling along lines |
 | `tifffile` | Reading and writing TIFF stacks, the standard format for microscopy image series |
+| `anthropic` | Anthropic API client for Claude Sonnet vision-based kymograph analysis |
+
+You will also need an Anthropic API key. Set it as an environment variable:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+```
 
 #### Platform-specific notes
 
@@ -69,6 +76,9 @@ If the input contains multiple channels (4D array), the first channel is used.
 | `--frame-interval` | `2.0` | Time between consecutive frames in seconds. Must match your acquisition settings. |
 | `--line-width` | `3` | Number of parallel lines to average when sampling the kymograph (see Kymograph Generation below). Higher values reduce noise but blur spatial features. Must be an odd integer. |
 | `--output-dir` | `<input>_results/` | Directory where all output files are written. Created automatically if it doesn't exist. |
+| `--model` | `claude-sonnet-4-6` | Vision model to use for kymograph analysis. |
+| `--api-key` | `$ANTHROPIC_API_KEY` | Anthropic API key. Defaults to the `ANTHROPIC_API_KEY` environment variable. |
+| `--interactive` | off | Use manual interactive mode instead of the vision model. In this mode, you click points along streaks and the tool fits lines with `numpy.polyfit`. |
 
 ### Example
 
@@ -84,6 +94,9 @@ python actin_retrograde_flow.py data/growth_cone_frames/ --line-width 5
 
 # Specify output location
 python actin_retrograde_flow.py data/wt_laminin.tif --output-dir results/experiment1/
+
+# Use manual interactive mode (no API key needed)
+python actin_retrograde_flow.py data/wt_laminin.tif --interactive
 ```
 
 ## Step-by-Step Workflow
@@ -126,41 +139,31 @@ The result is a 2D array of shape `(T, N)` where `T` is the number of time frame
 
 Each kymograph is saved as a 32-bit TIFF file so it can be opened in ImageJ/FIJI for further manual analysis if desired.
 
-### Step 4: Flow rate measurement via interactive slope fitting
+### Step 4: Flow rate measurement via vision model
 
-For each kymograph, a second interactive window opens where you measure the flow rate by clicking points along diagonal streaks and fitting a line through them.
+Each kymograph is rendered as a PNG image with calibrated axes (distance in μm on x-axis, time in seconds on y-axis) and sent to **Claude Sonnet**, a multimodal vision model that reads the image the same way a human researcher would:
 
-**How it works:**
+1. The model identifies **diagonal streaks** in the kymograph — these are the moving actin features whose slope encodes the flow velocity.
 
-1. The kymograph is displayed with calibrated axes (distance in μm on x, time in seconds on y).
+2. For each streak, the model reads **two coordinate points** directly from the calibrated axis labels: (x1 μm, t1 s) and (x2 μm, t2 s).
 
-2. You **left-click multiple points** along a single diagonal streak — the more points you click, the more accurate the fit. Clicking 3-5 points along a clearly visible streak is usually sufficient.
-
-3. **Right-click** (or press Enter) to finalize the streak. The tool fits a line through your clicked points using `numpy.polyfit` (least-squares, degree 1):
+3. The flow rate is computed from the slope using point-slope form:
 
 ```
-x(t) = slope * t + intercept
+rate (μm/min) = |x2 - x1| / |t2 - t1| × 60
 ```
 
-where `x` is position in μm and `t` is time in seconds. The fitted line is overlaid in red, and the flow rate and R² are displayed.
+4. If multiple streaks are detected, the tool averages their rates.
 
-4. The flow rate is simply the absolute value of the slope, converted to μm/min:
+5. The detected streak endpoints are overlaid on the kymograph in the output figure so you can visually verify the model's readings.
 
-```
-rate (μm/min) = |slope (μm/s)| × 60
-```
+**Why a vision model?**
 
-5. You can **measure multiple streaks** on the same kymograph — just keep clicking new sets of points and right-clicking to fit. The final rate for that line is the average across all measured streaks.
+We benchmarked 7 models (Claude Opus 4.6, Claude Sonnet 4.6, Claude Haiku 4.5, llava-llama3, minicpm-v, llava:7b, moondream) on kymographs with known flow rates. Claude Sonnet achieved the lowest mean absolute error (0.7 μm/min on the presentation kymographs, 1.4 μm/min across 5 test videos). Traditional computer vision methods (Hough transform, structure tensor, cross-correlation) all failed on compressed 8-bit video data, while the vision model correctly reads the slopes even in noisy kymographs — just like a human researcher does.
 
-6. Press **Enter** with no active points (or close the window) to move to the next kymograph.
+**Fallback: interactive mode**
 
-**Why manual slope fitting?**
-
-- It is the standard method used in the kymograph literature — the human eye is very good at identifying coherent streaks even in noisy data
-- The least-squares fit through multiple points is more robust than a two-point measurement
-- The R² value tells you how well the streak follows a straight line (R² > 0.9 is a good fit)
-- You can measure multiple streaks per kymograph and average them for a more reliable estimate
-- It works on any data quality — from raw 16-bit microscopy TIFFs to compressed presentation videos
+If you don't have an API key, use `--interactive` to manually click points along streaks. The tool fits a line through your points with `numpy.polyfit` and computes the rate from the slope.
 
 ### Step 5: Output generation
 

@@ -3,21 +3,29 @@ Actin Retrograde Flow Measurement Tool
 
 Measures retrograde flow rate of actin in neuronal growth cones from
 TIRF microscopy image stacks. The user draws lines along flow axes on
-the growth cone image, and the tool generates kymographs and computes
-flow rates from the slope of features in those kymographs.
+the growth cone image, and the tool generates kymographs and uses a
+vision model (Claude Sonnet) to identify diagonal streaks and compute
+flow rates from their slopes via point-slope form.
 
 Usage:
     python actin_retrograde_flow.py <image_stack> [--pixel-size 0.108] [--frame-interval 2.0]
 
     image_stack:      Path to a TIFF stack (multi-frame) or a directory of
                       sequentially numbered single-frame TIFFs.
-    --pixel-size:     μm per pixel (default: 0.108 μm/px, typical for 60x TIRF)
+    --pixel-size:     um per pixel (default: 0.108 um/px, typical for 60x TIRF)
     --frame-interval: seconds between frames (default: 2.0 s)
+
+Requires ANTHROPIC_API_KEY environment variable to be set.
 """
 
 import argparse
 import sys
 import os
+import re
+import json
+import base64
+import io
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -25,7 +33,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
-from scipy.ndimage import map_coordinates, gaussian_filter
+from scipy.ndimage import map_coordinates
 import tifffile
 
 
@@ -47,10 +55,9 @@ def load_stack(path: str) -> np.ndarray:
 
     if stack.ndim == 2:
         sys.exit("Only a single frame found — need a time series (multiple frames).")
-    # Handle multi-channel: take first channel or average
     if stack.ndim == 4:
-        stack = stack[:, 0]  # first channel
-    print(f"Loaded stack: {stack.shape[0]} frames, {stack.shape[1]}×{stack.shape[2]} px")
+        stack = stack[:, 0]
+    print(f"Loaded stack: {stack.shape[0]} frames, {stack.shape[1]}x{stack.shape[2]} px")
     return stack.astype(np.float64)
 
 
@@ -65,7 +72,7 @@ class LineDrawer:
 
     def __init__(self, image: np.ndarray):
         self.image = image
-        self.lines = []          # list of ((x0,y0), (x1,y1))
+        self.lines = []
         self._current_pt = None
         self._line_artists = []
         self._dot_artists = []
@@ -85,7 +92,6 @@ class LineDrawer:
         self.fig.canvas.mpl_connect("button_press_event", self._on_click)
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
 
-        # "Done" button
         ax_btn = self.fig.add_axes([0.8, 0.01, 0.15, 0.04])
         self._btn = Button(ax_btn, "Done")
         self._btn.on_clicked(lambda _: self._finish())
@@ -96,7 +102,7 @@ class LineDrawer:
     def _on_click(self, event):
         if event.inaxes != self.ax or self.done:
             return
-        if event.button == 3:  # right click = undo
+        if event.button == 3:
             self._undo()
             return
         x, y = event.xdata, event.ydata
@@ -110,13 +116,11 @@ class LineDrawer:
             self.lines.append(((x0, y0), (x, y)))
             ln, = self.ax.plot([x0, x], [y0, y], "r-", linewidth=1.5)
             self._line_artists.append(ln)
-            # Label
             mx, my = (x0 + x) / 2, (y0 + y) / 2
             self.ax.text(mx, my, f"L{len(self.lines)}", color="yellow",
                          fontsize=9, fontweight="bold",
                          ha="center", va="bottom")
             self._current_pt = None
-            # Remove the dot for first click
             if self._dot_artists:
                 self._dot_artists[-1].remove()
                 self._dot_artists.pop()
@@ -166,11 +170,10 @@ def make_kymograph(stack: np.ndarray, line, width: int = 3) -> np.ndarray:
     length = np.hypot(x1 - x0, y1 - y0)
     n_pts = int(np.ceil(length))
 
-    # Unit vectors along and perpendicular to the line
     dx, dy = (x1 - x0) / length, (y1 - y0) / length
-    nx, ny = -dy, dx  # normal
+    nx, ny = -dy, dx
 
-    offsets = np.arange(-(width // 2), width // 2 + 1)  # e.g. [-1, 0, 1]
+    offsets = np.arange(-(width // 2), width // 2 + 1)
     t_vals = np.linspace(0, 1, n_pts)
 
     kymo = np.zeros((stack.shape[0], n_pts))
@@ -181,100 +184,236 @@ def make_kymograph(stack: np.ndarray, line, width: int = 3) -> np.ndarray:
         for off in offsets:
             xs = x0 + t_vals * (x1 - x0) + off * nx
             ys = y0 + t_vals * (y1 - y0) + off * ny
-            coords = np.vstack([ys, xs])  # map_coordinates expects (row, col)
+            coords = np.vstack([ys, xs])
             accum += map_coordinates(frame, coords, order=1, mode="nearest")
         kymo[frame_idx] = accum / len(offsets)
 
     return kymo
 
 
+def render_kymograph_image(kymo: np.ndarray, pixel_size: float,
+                           frame_interval: float, label: str = "") -> bytes:
+    """Render a kymograph as a PNG image with calibrated axes.
+    Returns the PNG bytes."""
+    t_extent = kymo.shape[0] * frame_interval
+    d_extent = kymo.shape[1] * pixel_size
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.imshow(kymo, cmap="gray", aspect="auto",
+              extent=[0, d_extent, t_extent, 0])
+    ax.set_xlabel("Distance (um)", fontsize=14)
+    ax.set_ylabel("Time (s)", fontsize=14)
+    if label:
+        ax.set_title(label, fontsize=14)
+    ax.tick_params(labelsize=12)
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
 # ---------------------------------------------------------------------------
-# Flow rate measurement
+# Vision model flow rate measurement
 # ---------------------------------------------------------------------------
+
+KYMOGRAPH_PROMPT = """You are analyzing a kymograph image from TIRF microscopy of actin retrograde flow in a neuronal growth cone.
+
+In this image:
+- The x-axis shows distance in micrometers (um).
+- The y-axis shows time in seconds (s), increasing downward.
+- Diagonal streaks represent moving actin features.
+- The slope of a streak gives the flow velocity.
+
+Your task:
+1. Identify the clearest diagonal streak(s) — these are lines that are tilted, NOT vertical (vertical = stationary).
+2. For each streak, read two points precisely from the axis labels: (x1 um, t1 s) and (x2 um, t2 s).
+3. Compute the flow rate for each streak: rate = |x2 - x1| / |t2 - t1| * 60 um/min
+
+You MUST respond in this exact JSON format and nothing else:
+{
+  "streaks": [
+    {"x1": 0.0, "t1": 0.0, "x2": 0.0, "t2": 0.0, "rate_um_per_min": 0.0}
+  ]
+}
+
+If you identify multiple streaks, include them all. Read the axis values carefully."""
+
+
+def measure_flow_rate_vision(kymo_png: bytes, api_key: str,
+                             model: str = "claude-sonnet-4-6") -> dict:
+    """Send a kymograph image to a Claude vision model and extract
+    the flow rate from its analysis of diagonal streak slopes.
+
+    Args:
+        kymo_png: PNG image bytes of the rendered kymograph
+        api_key:  Anthropic API key
+        model:    Model to use (default: claude-sonnet-4-6)
+
+    Returns:
+        dict with rate_um_per_min and streak details
+    """
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=api_key)
+    img_b64 = base64.b64encode(kymo_png).decode()
+
+    message = client.messages.create(
+        model=model,
+        max_tokens=1024,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": img_b64,
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": KYMOGRAPH_PROMPT,
+                },
+            ],
+        }],
+    )
+
+    response_text = message.content[0].text.strip()
+
+    # Extract JSON from response
+    try:
+        # Try direct parse
+        data = json.loads(response_text)
+    except json.JSONDecodeError:
+        # Try to find JSON in the response
+        match = re.search(r'\{[\s\S]*\}', response_text)
+        if match:
+            try:
+                data = json.loads(match.group())
+            except json.JSONDecodeError:
+                print(f"    Warning: Could not parse model response as JSON")
+                print(f"    Response: {response_text[:200]}")
+                return {"streaks": [], "rate_um_per_min": 0.0}
+        else:
+            print(f"    Warning: No JSON found in model response")
+            print(f"    Response: {response_text[:200]}")
+            return {"streaks": [], "rate_um_per_min": 0.0}
+
+    streaks = data.get("streaks", [])
+    if not streaks:
+        return {"streaks": [], "rate_um_per_min": 0.0}
+
+    # Validate and recompute rates from the coordinates
+    valid_streaks = []
+    for s in streaks:
+        try:
+            x1, t1 = float(s["x1"]), float(s["t1"])
+            x2, t2 = float(s["x2"]), float(s["t2"])
+            dt = abs(t2 - t1)
+            dx = abs(x2 - x1)
+            if dt < 0.1:
+                continue
+            rate = dx / dt * 60.0
+            valid_streaks.append({
+                "x1": x1, "t1": t1, "x2": x2, "t2": t2,
+                "rate_um_per_min": rate,
+            })
+        except (KeyError, ValueError, TypeError):
+            continue
+
+    if not valid_streaks:
+        return {"streaks": [], "rate_um_per_min": 0.0}
+
+    avg_rate = np.mean([s["rate_um_per_min"] for s in valid_streaks])
+    return {
+        "streaks": valid_streaks,
+        "rate_um_per_min": float(avg_rate),
+    }
+
 
 def measure_flow_rate(kymo: np.ndarray, pixel_size: float,
-                      frame_interval: float) -> dict:
-    """Automatically measure the dominant streak slope in a kymograph
-    using the structure tensor method.
+                      frame_interval: float, api_key: str = None,
+                      model: str = "claude-sonnet-4-6") -> dict:
+    """Measure flow rate from a kymograph.
 
-    The structure tensor captures the local orientation of intensity
-    gradients at every pixel. By averaging the tensor over the entire
-    kymograph (after removing stationary features), the dominant
-    orientation of moving streaks is recovered — even in noisy or
-    compressed data where edge detection fails.
-
-    The dominant angle is converted to a flow rate via point-slope form:
-        rate (μm/min) = |Δx / Δt| * 60
-
-    where Δx and Δt are read from the kymograph axes (space in μm,
-    time in seconds).
+    If an API key is provided, uses Claude Sonnet vision to read the
+    kymograph slopes. Otherwise falls back to manual interactive mode.
     """
-    T, N = kymo.shape
-
-    # --- Preprocess: isolate moving features ---
-    # Temporal derivative: diff along time axis highlights motion,
-    # suppresses stationary structures completely
-    kymo_diff = np.diff(kymo.astype(np.float64), axis=0)
-    # Also subtract the spatial mean per row to remove global flicker
-    kymo_hp = kymo_diff - kymo_diff.mean(axis=1, keepdims=True)
-    # Smooth to reduce noise
-    kymo_hp = gaussian_filter(kymo_hp, sigma=1.0)
-    T, N = kymo_hp.shape
-
-    # --- Structure tensor in physical coordinates ---
-    # Compute gradients in physical units so the angle is meaningful.
-    # x-axis: space (μm), y-axis: time (s)
-    # np.gradient with axis spacing: dx = pixel_size, dy = frame_interval
-    Iy, Ix = np.gradient(kymo_hp, frame_interval, pixel_size)
-
-    # Structure tensor components, smoothed over a neighborhood
-    sigma_st = max(3.0, min(T, N) * 0.15)
-    Jxx = gaussian_filter(Ix * Ix, sigma=sigma_st)
-    Jxy = gaussian_filter(Ix * Iy, sigma=sigma_st)
-    Jyy = gaussian_filter(Iy * Iy, sigma=sigma_st)
-
-    # Global structure tensor (sum over all pixels)
-    S_xx = Jxx.sum()
-    S_xy = Jxy.sum()
-    S_yy = Jyy.sum()
-
-    # Dominant gradient orientation
-    theta = 0.5 * np.arctan2(2 * S_xy, S_xx - S_yy)
-
-    # The gradient is perpendicular to the streak direction.
-    # Streak direction = theta + π/2.
-    # Streak slope (dx/dt) where x=μm, t=seconds:
-    #   streak runs along direction (cos(theta+π/2), sin(theta+π/2))
-    #                              = (-sin(theta), cos(theta))
-    #   dx/dt = -sin(theta) / cos(theta) = -tan(theta)
-    # But we only care about |dx/dt| for the rate.
-
-    if abs(np.cos(theta)) < 1e-6:
-        velocity_um_per_s = 0.0
+    if api_key:
+        kymo_png = render_kymograph_image(kymo, pixel_size, frame_interval)
+        return measure_flow_rate_vision(kymo_png, api_key, model)
     else:
-        velocity_um_per_s = abs(np.sin(theta) / np.cos(theta))
+        # Fallback: manual interactive slope picking
+        return _measure_flow_rate_interactive(kymo, pixel_size, frame_interval)
 
-    rate_um_per_min = velocity_um_per_s * 60.0
 
-    # Coherence: how strongly oriented is the structure tensor?
-    trace = S_xx + S_yy
-    det = S_xx * S_yy - S_xy * S_xy
-    discrim = max(0, trace * trace - 4 * det)
-    lam1 = (trace + np.sqrt(discrim)) / 2
-    lam2 = (trace - np.sqrt(discrim)) / 2
-    coherence = ((lam1 - lam2) / (lam1 + lam2)) ** 2 if (lam1 + lam2) > 0 else 0
+def _measure_flow_rate_interactive(kymo, pixel_size, frame_interval):
+    """Fallback: interactive matplotlib window where user clicks points
+    along streaks and numpy.polyfit fits a line."""
+    t_extent = kymo.shape[0] * frame_interval
+    d_extent = kymo.shape[1] * pixel_size
 
-    return {
-        "streaks": [{
-            "rate_um_per_min": rate_um_per_min,
-            "slope_um_per_s": velocity_um_per_s,
-            "angle_deg": np.degrees(theta),
-            "coherence": coherence,
-        }],
-        "rate_um_per_min": rate_um_per_min,
-        "coherence": coherence,
-        "angle_deg": np.degrees(theta),
-    }
+    print("    Interactive mode: click points along a streak, right-click to fit.")
+    print("    Press Enter when done.")
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.imshow(kymo, cmap="gray", aspect="auto",
+              extent=[0, d_extent, t_extent, 0])
+    ax.set_xlabel("Distance (um)")
+    ax.set_ylabel("Time (s)")
+    ax.set_title("Click points along streak, right-click to fit. Enter to finish.")
+
+    state = {"pts": [], "streaks": [], "dots": []}
+
+    def on_click(event):
+        if event.inaxes != ax:
+            return
+        if event.button == 3:  # right-click = fit
+            if len(state["pts"]) >= 2:
+                pts = np.array(state["pts"])
+                coeffs = np.polyfit(pts[:, 1], pts[:, 0], 1)
+                rate = abs(coeffs[0]) * 60.0
+                state["streaks"].append({"rate_um_per_min": rate})
+                t_fit = np.array([pts[:, 1].min(), pts[:, 1].max()])
+                x_fit = np.polyval(coeffs, t_fit)
+                ax.plot(x_fit, t_fit, "r-", lw=2)
+                ax.text(x_fit.mean(), t_fit.mean(), f"{rate:.1f} um/min",
+                        color="yellow", fontsize=10, fontweight="bold")
+                fig.canvas.draw_idle()
+                print(f"      Streak: {rate:.1f} um/min")
+            for d in state["dots"]:
+                d.remove()
+            state["dots"].clear()
+            state["pts"].clear()
+            fig.canvas.draw_idle()
+            return
+        state["pts"].append((event.xdata, event.ydata))
+        dot, = ax.plot(event.xdata, event.ydata, "r+", ms=12, mew=2)
+        state["dots"].append(dot)
+        fig.canvas.draw_idle()
+
+    def on_key(event):
+        if event.key == "enter":
+            if state["pts"] and len(state["pts"]) >= 2:
+                # Fit remaining points
+                pts = np.array(state["pts"])
+                coeffs = np.polyfit(pts[:, 1], pts[:, 0], 1)
+                rate = abs(coeffs[0]) * 60.0
+                state["streaks"].append({"rate_um_per_min": rate})
+            plt.close(fig)
+
+    fig.canvas.mpl_connect("button_press_event", on_click)
+    fig.canvas.mpl_connect("key_press_event", on_key)
+    plt.show()
+
+    if not state["streaks"]:
+        return {"streaks": [], "rate_um_per_min": 0.0}
+    rates = [s["rate_um_per_min"] for s in state["streaks"]]
+    return {"streaks": state["streaks"], "rate_um_per_min": np.mean(rates)}
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +423,7 @@ def measure_flow_rate(kymo: np.ndarray, pixel_size: float,
 def plot_results(stack, lines, kymographs, measurements,
                  pixel_size, frame_interval, output_dir):
     """Generate a multi-panel figure with the annotated image, kymographs
-    with fitted slopes overlaid, and a summary bar chart of flow rates."""
+    with detected slopes overlaid, and a summary bar chart of flow rates."""
 
     n_lines = len(lines)
     fig = plt.figure(figsize=(5 + 5 * n_lines, 10))
@@ -301,7 +440,7 @@ def plot_results(stack, lines, kymographs, measurements,
     ax_img.set_title("Growth cone + lines")
     ax_img.axis("off")
 
-    # -- Kymograph panels with fit lines --
+    # -- Kymograph panels with detected streak lines --
     for i in range(n_lines):
         ax_k = fig.add_subplot(2, n_lines + 1, 2 + i)
         kymo = kymographs[i]
@@ -309,34 +448,28 @@ def plot_results(stack, lines, kymographs, measurements,
         d_extent = kymo.shape[1] * pixel_size
         ax_k.imshow(kymo, cmap="gray", aspect="auto",
                     extent=[0, d_extent, t_extent, 0])
-        ax_k.set_xlabel("Distance (μm)")
+        ax_k.set_xlabel("Distance (um)")
         ax_k.set_ylabel("Time (s)")
         rate = measurements[i]["rate_um_per_min"]
-        ax_k.set_title(f"L{i+1} kymograph\n{rate:.1f} μm/min")
+        ax_k.set_title(f"L{i+1} kymograph\n{rate:.1f} um/min")
 
-        # Overlay detected streak lines
+        # Overlay detected streak lines from vision model
         for streak in measurements[i].get("streaks", []):
-            angle_rad = np.radians(streak["angle_deg"])
-            dist = streak["dist"]
-            # Reconstruct line endpoints in pixel space, then convert
-            cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
-            # Line in pixel coords: x*cos + y*sin = dist
-            # Solve for x at y=0 and y=T-1
-            if abs(sin_a) > 1e-6:
-                x_at_y0 = dist / cos_a if abs(cos_a) > 1e-6 else 0
-                y0_px, y1_px = 0, kymo.shape[0] - 1
-                x0_px = (dist - y0_px * sin_a) / cos_a if abs(cos_a) > 1e-6 else 0
-                x1_px = (dist - y1_px * sin_a) / cos_a if abs(cos_a) > 1e-6 else 0
-                ax_k.plot([x0_px * pixel_size, x1_px * pixel_size],
-                          [y0_px * frame_interval, y1_px * frame_interval],
-                          "r-", linewidth=1.5, alpha=0.7)
+            if "x1" in streak and "t1" in streak:
+                ax_k.plot([streak["x1"], streak["x2"]],
+                          [streak["t1"], streak["t2"]],
+                          "r-", linewidth=2, alpha=0.8)
+                mx = (streak["x1"] + streak["x2"]) / 2
+                mt = (streak["t1"] + streak["t2"]) / 2
+                ax_k.plot(streak["x1"], streak["t1"], "r+", ms=10, mew=2)
+                ax_k.plot(streak["x2"], streak["t2"], "r+", ms=10, mew=2)
 
     # -- Bar chart of flow rates --
     ax_bar = fig.add_subplot(2, 1, 2)
     labels = [f"L{i+1}" for i in range(n_lines)]
     rates = [m["rate_um_per_min"] for m in measurements]
     ax_bar.bar(labels, rates, color="steelblue", edgecolor="black")
-    ax_bar.set_ylabel("Actin flow rate (μm/min)")
+    ax_bar.set_ylabel("Actin flow rate (um/min)")
     ax_bar.set_title("Actin retrograde flow")
     for j, r in enumerate(rates):
         ax_bar.text(j, r + 0.2, f"{r:.1f}", ha="center", fontsize=9)
@@ -353,25 +486,32 @@ def plot_results(stack, lines, kymographs, measurements,
 # ---------------------------------------------------------------------------
 
 def export_csv(lines, measurements, pixel_size, frame_interval, output_dir):
-    """Write a summary CSV with flow rates and fit quality."""
+    """Write a summary CSV with flow rates and streak coordinates."""
     summary_path = os.path.join(output_dir, "flow_rate_summary.csv")
     with open(summary_path, "w") as f:
-        f.write("line,x0,y0,x1,y1,length_um,rate_um_per_min,"
-                "n_streaks,slope_um_per_s,r_squared\n")
+        f.write("line,x0_px,y0_px,x1_px,y1_px,length_um,"
+                "rate_um_per_min,n_streaks\n")
         for i, (line, m) in enumerate(zip(lines, measurements)):
             (x0, y0), (x1, y1) = line
             length = np.hypot(x1 - x0, y1 - y0) * pixel_size
-            streaks = m.get("streaks", [])
-            if streaks:
-                avg_slope = np.mean([s["slope_um_per_s"] for s in streaks])
-                avg_r2 = np.mean([s["r_squared"] for s in streaks])
-            else:
-                avg_slope = 0.0
-                avg_r2 = 0.0
+            n_streaks = len(m.get("streaks", []))
             f.write(f"L{i+1},{x0:.1f},{y0:.1f},{x1:.1f},{y1:.1f},"
-                    f"{length:.2f},{m['rate_um_per_min']:.2f},"
-                    f"{len(streaks)},{avg_slope:.4f},{avg_r2:.3f}\n")
+                    f"{length:.2f},{m['rate_um_per_min']:.2f},{n_streaks}\n")
     print(f"Saved summary: {summary_path}")
+
+    # Per-line streak details
+    for i, m in enumerate(measurements):
+        streaks = m.get("streaks", [])
+        if not streaks:
+            continue
+        streak_path = os.path.join(output_dir, f"L{i+1}_streaks.csv")
+        with open(streak_path, "w") as f:
+            f.write("streak,x1_um,t1_s,x2_um,t2_s,rate_um_per_min\n")
+            for j, s in enumerate(streaks):
+                f.write(f"{j+1},{s.get('x1',0):.2f},{s.get('t1',0):.2f},"
+                        f"{s.get('x2',0):.2f},{s.get('t2',0):.2f},"
+                        f"{s['rate_um_per_min']:.2f}\n")
+        print(f"Saved: {streak_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -385,14 +525,34 @@ def main():
     parser.add_argument("image_stack",
                         help="Path to a multi-frame TIFF or directory of TIFFs")
     parser.add_argument("--pixel-size", type=float, default=0.108,
-                        help="μm per pixel (default: 0.108)")
+                        help="um per pixel (default: 0.108)")
     parser.add_argument("--frame-interval", type=float, default=2.0,
                         help="Seconds between frames (default: 2.0)")
     parser.add_argument("--line-width", type=int, default=3,
-                        help="Width of sampling band around each line in px (default: 3)")
+                        help="Width of sampling band in px (default: 3)")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory (default: same as input)")
+    parser.add_argument("--model", type=str, default="claude-sonnet-4-6",
+                        help="Vision model to use (default: claude-sonnet-4-6)")
+    parser.add_argument("--api-key", type=str, default=None,
+                        help="Anthropic API key (default: ANTHROPIC_API_KEY env var)")
+    parser.add_argument("--interactive", action="store_true",
+                        help="Use interactive manual mode instead of vision model")
     args = parser.parse_args()
+
+    # API key
+    api_key = args.api_key or os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key and not args.interactive:
+        print("Warning: No ANTHROPIC_API_KEY set. Falling back to interactive mode.")
+        print("Set ANTHROPIC_API_KEY or use --interactive flag.\n")
+        args.interactive = True
+
+    if not args.interactive:
+        try:
+            import anthropic
+        except ImportError:
+            sys.exit("Error: 'anthropic' package not installed. "
+                     "Run: pip install anthropic")
 
     # Load
     stack = load_stack(args.image_stack)
@@ -412,7 +572,7 @@ def main():
     lines = drawer.run()
 
     if not lines:
-        sys.exit("No lines drawn — exiting.")
+        sys.exit("No lines drawn -- exiting.")
 
     print(f"\n{len(lines)} line(s) drawn. Generating kymographs...")
 
@@ -422,20 +582,37 @@ def main():
         kymo = make_kymograph(stack, line, width=args.line_width)
         kymographs.append(kymo)
 
-    # Automatically detect streaks and measure flow rates
+    # Measure flow rates
+    if args.interactive:
+        print("\nInteractive mode: click points along streaks in each kymograph.")
+    else:
+        print(f"\nAnalyzing kymographs with {args.model}...")
+
     measurements = []
     for i, kymo in enumerate(kymographs):
-        m = measure_flow_rate(kymo, args.pixel_size, args.frame_interval)
+        print(f"  L{i+1}:", end=" ", flush=True)
+        m = measure_flow_rate(
+            kymo, args.pixel_size, args.frame_interval,
+            api_key=None if args.interactive else api_key,
+            model=args.model,
+        )
         measurements.append(m)
         n_streaks = len(m.get("streaks", []))
-        print(f"  L{i+1}: {m['rate_um_per_min']:.2f} μm/min "
-              f"({n_streaks} streak(s) detected)")
+        print(f"{m['rate_um_per_min']:.2f} um/min ({n_streaks} streak(s))")
 
     # Save kymographs as TIFFs
     for i, kymo in enumerate(kymographs):
         kymo_path = os.path.join(out_dir, f"L{i+1}_kymograph.tif")
         tifffile.imwrite(kymo_path, kymo.astype(np.float32))
-        print(f"  Saved kymograph TIFF: {kymo_path}")
+
+    # Save kymograph PNGs (for reference)
+    for i, kymo in enumerate(kymographs):
+        png_bytes = render_kymograph_image(
+            kymo, args.pixel_size, args.frame_interval,
+            label=f"L{i+1} kymograph")
+        png_path = os.path.join(out_dir, f"L{i+1}_kymograph.png")
+        with open(png_path, "wb") as f:
+            f.write(png_bytes)
 
     # Plot & export
     plot_results(stack, lines, kymographs, measurements,
